@@ -11,3 +11,4 @@ chromadb==0.5.11
 open-clip-torch
 sentence-transformers
 spotipy
+pyarrow

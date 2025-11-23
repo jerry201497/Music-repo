@@ -42,30 +42,56 @@ def get_spotify_enrichment(sp, row):
     try:
         res = sp.search(q, limit=1, type="track")
         items = res.get("tracks", {}).get("items", [])
-        if not items: 
+        if not items:
             return {}
+
         t = items[0]
-        album = t["album"]
-        artist_ids = [a["id"] for a in t["artists"] if a.get("id")]
+        album = t.get("album", {})
+
+        # ---- Artists & genres ----
+        artist_ids = [a["id"] for a in t.get("artists", []) if a.get("id")]
         genres = []
+        artist_cover_url = None
+
         for aid in artist_ids:
             try:
                 a = sp.artist(aid)
                 genres.extend(a.get("genres", []))
+
+                # fallback cover from artist image (largest)
+                imgs = a.get("images", [])
+                if imgs and not artist_cover_url:
+                    # Spotify returns sorted desc by size often, but we sort to be safe
+                    artist_cover_url = sorted(imgs, key=lambda x: x.get("width", 0))[-1]["url"]
+
                 time.sleep(0.05)
             except Exception:
                 pass
+
+        # ---- Cover: album first ----
         cover_url = None
-        if album.get("images"):
-            cover_url = sorted(album["images"], key=lambda x: x["width"])[-1]["url"]
+        album_images = album.get("images", [])
+        if album_images:
+            # take largest
+            cover_url = sorted(album_images, key=lambda x: x.get("width", 0))[-1]["url"]
+
+        # ---- Fallback if album has no image ----
+        if not cover_url:
+            cover_url = artist_cover_url
+
         return {
-            "spotify_track_id": t["id"],
+            "spotify_track_id": t.get("id"),
             "spotify_artist_ids": artist_ids,
             "spotify_album_id": album.get("id"),
             "spotify_cover_url": cover_url,
             "spotify_genres": list(sorted(set(genres))) if genres else None,
             "spotify_popularity": t.get("popularity"),
+            # extra fields you might want later:
+            "spotify_album_name": album.get("name"),
+            "spotify_release_date": album.get("release_date"),
+            "spotify_duration_ms": t.get("duration_ms"),
         }
+
     except Exception:
         return {}
 
@@ -90,7 +116,7 @@ def main():
     if not csv_path.exists():
         raise FileNotFoundError("Missing input: data/music/raw/tracks.csv")
     df = pd.read_csv(csv_path)
-
+    df = df.sample(3000, random_state=42) # for quicker testing; remove in prod
     keep = [c for c in ["track_name","artist_name","album_name","genre","year"] if c in df.columns]
     df = df[keep].dropna(subset=["track_name","artist_name"]).drop_duplicates()
 
