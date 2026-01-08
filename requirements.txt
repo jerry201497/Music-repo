@@ -12,3 +12,4 @@ open-clip-torch
 sentence-transformers
 spotipy
 pyarrow
+matplotlib

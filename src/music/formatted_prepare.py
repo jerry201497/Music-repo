@@ -1,12 +1,16 @@
-import os, json, re, ast
+import os, json, re
 from pathlib import Path
 from dotenv import load_dotenv
+
+import numpy as np
 import boto3
 import pandas as pd
 from PIL import Image
+from botocore.exceptions import ClientError
+
 
 # -----------------------------
-# S3 / MinIO helpers
+# S3 helpers
 # -----------------------------
 def s3():
     load_dotenv()
@@ -15,26 +19,47 @@ def s3():
         endpoint_url=os.getenv("MINIO_ENDPOINT", "http://localhost:9000"),
         aws_access_key_id=os.getenv("MINIO_ROOT_USER"),
         aws_secret_access_key=os.getenv("MINIO_ROOT_PASSWORD"),
-        region_name="us-east-1",
+        region_name=os.getenv("MINIO_REGION", "us-east-1"),
     )
 
-def download(bucket, key, local):
-    Path(local).parent.mkdir(parents=True, exist_ok=True)
-    s3().download_file(bucket, key, str(local))
 
-def upload(bucket, local, key, content_type=None):
-    extra = {"ContentType": content_type} if content_type else {}
-    s3().upload_file(str(local), bucket, key, ExtraArgs=extra)
-
-def ensure_bucket(name):
-    c = s3()
+def ensure_bucket(name: str):
+    cli = s3()
     try:
-        c.head_bucket(Bucket=name)
+        cli.head_bucket(Bucket=name)
     except Exception:
-        c.create_bucket(Bucket=name)
+        try:
+            cli.create_bucket(Bucket=name)
+        except Exception:
+            pass
+
+
+def download(bucket: str, key: str, local: Path) -> bool:
+    local = Path(local)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        s3().download_file(bucket, key, str(local))
+        return True
+    except Exception as e:
+        print(f"[WARN] download failed: s3://{bucket}/{key} -> {local}: {e}")
+        return False
+
+
+def upload(bucket: str, local: Path, key: str, content_type: str | None = None) -> bool:
+    extra = {"ContentType": content_type} if content_type else {}
+    try:
+        s3().upload_file(str(local), bucket, key, ExtraArgs=extra)
+        return True
+    except ClientError as e:
+        print(f"[WARN] upload failed for {local} -> s3://{bucket}/{key}: {e}")
+        return False
+    except Exception as e:
+        print(f"[WARN] upload failed for {local} -> s3://{bucket}/{key}: {e}")
+        return False
+
 
 # -----------------------------
-# Text normalization
+# Formatting helpers
 # -----------------------------
 def normalize_text(s):
     if pd.isna(s):
@@ -43,178 +68,226 @@ def normalize_text(s):
     s = re.sub(r"\s+", " ", s)
     return s.lower()
 
-def parse_genres(val):
+
+def _safe_year(release_date):
     """
-    spotify_genres from landing may be:
-    - list
-    - stringified list: "['pop','rock']"
-    - comma separated string: "pop, rock"
-    - None / NaN
-    Returns first genre if available.
+    Spotify release_date can be 'YYYY', 'YYYY-MM', 'YYYY-MM-DD'
     """
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+    if not isinstance(release_date, str) or not release_date:
+        return None
+    try:
+        return int(release_date.split("-")[0])
+    except Exception:
         return None
 
-    if isinstance(val, list):
-        return val[0] if val else None
 
-    if isinstance(val, str):
-        v = val.strip()
-        if not v:
-            return None
-        # try list literal
-        try:
-            parsed = ast.literal_eval(v)
-            if isinstance(parsed, list) and parsed:
-                return parsed[0]
-        except Exception:
-            pass
-        # fallback comma split
-        parts = [p.strip() for p in v.split(",") if p.strip()]
-        return parts[0] if parts else None
-
-    return None
-
-# -----------------------------
-# Refine Spotify fields
-# -----------------------------
 def refine_spotify(df: pd.DataFrame) -> pd.DataFrame:
     refined_rows = []
 
     for _, r in df.iterrows():
-        track_name  = normalize_text(r.get("track_name", ""))
-        artist_name = normalize_text(r.get("artist_name", ""))
-        album_name  = normalize_text(r.get("album_name", ""))
+        album_name = r.get("spotify_album_name")
+        release_date = r.get("spotify_release_date")
+        year = _safe_year(release_date)
 
-        # Prefer Spotify cover from landing (already extracted)
-        cover_url = r.get("spotify_cover_url", None)
-        if pd.isna(cover_url):
-            cover_url = None
+        dur_ms = r.get("spotify_duration_ms")
+        dur_sec = round(float(dur_ms) / 1000.0, 2) if pd.notna(dur_ms) else None
 
-        # Duration (ms -> sec)
-        dur_ms = r.get("spotify_duration_ms", None)
-        if dur_ms is None or (isinstance(dur_ms, float) and pd.isna(dur_ms)):
-            duration_sec = None
-        else:
-            try:
-                duration_sec = round(float(dur_ms) / 1000.0, 2)
-            except Exception:
-                duration_sec = None
-
-        # Year: prefer landing "year", else spotify release year if present
-        year = r.get("year", None)
-        if year is None or (isinstance(year, float) and pd.isna(year)):
-            # try spotify_release_date if exists
-            rd = r.get("spotify_release_date", None)
-            if isinstance(rd, str) and rd:
-                try:
-                    year = int(rd.split("-")[0])
-                except Exception:
-                    year = None
-            else:
-                year = None
-        else:
-            try:
-                year = int(year)
-            except Exception:
-                year = None
-
-        # Genre unified: prefer spotify_genres, fallback to original genre
-        sp_genre = parse_genres(r.get("spotify_genres", None))
-        base_genre = normalize_text(r.get("genre", "")) or None
-        genre_unified = sp_genre or base_genre
+        # genre: prefer original genre, else spotify_genres
+        genre = r.get("genre", None)
+        if genre is None or (isinstance(genre, float) and pd.isna(genre)) or str(genre).strip() == "":
+            genre = r.get("spotify_genres", None)
 
         refined_rows.append({
-            # --- columns REQUIRED by Trusted Zone ---
-            "track_name": track_name,
-            "artist_name": artist_name,
+            "track_name": r.get("track_name", ""),
+            "artist_name": r.get("artist_name", ""),
             "album_name": album_name,
-
-            # --- refined / final columns you want ---
-            "genre": genre_unified,
+            "genre": genre,
             "year": year,
-            "duration_sec": duration_sec,
-            "cover_url": cover_url,
+            "duration_sec": dur_sec,
+            "cover_url": r.get("spotify_cover_url"),
+
+            # audio features (may be null)
+            "sp_danceability": r.get("sp_danceability"),
+            "sp_energy": r.get("sp_energy"),
+            "sp_valence": r.get("sp_valence"),
+            "sp_speechiness": r.get("sp_speechiness"),
+            "sp_acousticness": r.get("sp_acousticness"),
+            "sp_instrumentalness": r.get("sp_instrumentalness"),
+            "sp_liveness": r.get("sp_liveness"),
+            "sp_loudness": r.get("sp_loudness"),
+            "sp_tempo": r.get("sp_tempo"),
         })
 
     return pd.DataFrame(refined_rows)
 
+
+def load_manifest() -> dict:
+    """
+    Manifest is written by landing_ingest.py at:
+      cache/landing/manifest.json
+    """
+    p = Path("cache/landing/manifest.json")
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def covers_to_convert_from_manifest(manifest: dict) -> list[str]:
+    """
+    New landing_ingest.py writes:
+      "covers_in_run": ["<albumid>.jpg", ...]
+    Return that list, otherwise empty.
+    """
+    covers = manifest.get("covers_in_run")
+    if isinstance(covers, list):
+        return [c for c in covers if isinstance(c, str) and c.lower().endswith(".jpg")]
+    return []
+
+
+def norm_key(x):
+    if pd.isna(x):
+        return ""
+    return " ".join(str(x).strip().lower().split())
+
+def load_kaggle_audio(kaggle_path: str) -> pd.DataFrame:
+    k = pd.read_csv(kaggle_path)
+
+    # keep only what we need
+    keep = ["artist_name", "track_name", "danceability", "loudness",
+            "acousticness", "instrumentalness", "valence", "energy"]
+    k = k[[c for c in keep if c in k.columns]].copy()
+
+    k["k_track"] = k["track_name"].map(norm_key)
+    k["k_artist"] = k["artist_name"].map(norm_key)
+
+    # dedupe to avoid exploding merges
+    k = k.drop_duplicates(subset=["k_track", "k_artist"])
+
+    # rename to avoid collisions
+    return k.rename(columns={
+        "danceability": "k_danceability",
+        "loudness": "k_loudness",
+        "acousticness": "k_acousticness",
+        "instrumentalness": "k_instrumentalness",
+        "valence": "k_valence",
+        "energy": "k_energy",
+    })
+
 # -----------------------------
-# MAIN FORMATTED PIPELINE
+# MAIN
 # -----------------------------
 def main():
     load_dotenv()
-    b_in  = os.getenv("S3_BUCKET_LANDING",  "landing_zone")
-    b_out = os.getenv("S3_BUCKET_FORMATTED","formatted_zone")
+    b_in = os.getenv("S3_BUCKET_LANDING", "landing")
+    b_out = os.getenv("S3_BUCKET_FORMATTED", "formatted")
     ensure_bucket(b_out)
 
-    # 1) Load enriched landing data (CORRECT source)
-    download(
-        b_in,
-        "music/persistent_landing/tracks_enriched.csv",
-        "cache/landing/tracks_enriched.csv"
-    )
-    df = pd.read_csv("cache/landing/tracks_enriched.csv")
+    # 1) Load enriched landing data (prefer local if it already exists)
+    local_enriched = Path("cache/landing/tracks_enriched.csv")
+    if not local_enriched.exists():
+        ok = download(b_in, "music/persistent_landing/tracks_enriched.csv", local_enriched)
+        if not ok:
+            raise FileNotFoundError("tracks_enriched.csv not found locally and cannot be downloaded from S3.")
 
-    # 2) Refine Spotify + normalize
+    df = pd.read_csv(local_enriched)
+
+    # ---- Fill audio features from Kaggle dataset (fast, no Spotify needed) ----
+    kaggle_csv = "cache/formatted/tcc_ceds_music.csv"
+    if Path(kaggle_csv).exists():
+        k = load_kaggle_audio(kaggle_csv)
+
+        df["k_track"] = df["track_name"].map(norm_key)
+        df["k_artist"] = df["artist_name"].map(norm_key)
+
+        df = df.merge(k, how="left", left_on=["k_track", "k_artist"], right_on=["k_track", "k_artist"])
+
+        # If Spotify sp_* is missing, fill from Kaggle
+        def fill(col_sp, col_k):
+            if col_sp not in df.columns:
+                df[col_sp] = np.nan
+            df[col_sp] = df[col_sp].where(df[col_sp].notna(), df[col_k])
+
+        fill("sp_danceability", "k_danceability")
+        fill("sp_loudness", "k_loudness")
+        fill("sp_acousticness", "k_acousticness")
+        fill("sp_instrumentalness", "k_instrumentalness")
+        fill("sp_valence", "k_valence")
+        fill("sp_energy", "k_energy")
+
+        # cleanup helper cols
+        df = df.drop(columns=[c for c in ["k_track","k_artist","k_danceability","k_loudness","k_acousticness",
+                                        "k_instrumentalness","k_valence","k_energy"] if c in df.columns])
+    else:
+        print(f"[WARN] Kaggle file not found at {kaggle_csv}, skipping audio fill.")
+
+
+    # 2) Refine
     df_refined = refine_spotify(df)
 
-    # 3) Save refined table (Parquet + CSV)
     out_dir = Path("cache/formatted")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_parq = out_dir / "tracks_refined.parquet"
-    out_csv  = out_dir / "tracks_refined.csv"
+    out_parquet = out_dir / "tracks_refined.parquet"
+    out_csv = out_dir / "tracks_refined.csv"
 
-    df_refined.to_parquet(out_parq, index=False)
+    df_refined.to_parquet(out_parquet, index=False)
     df_refined.to_csv(out_csv, index=False)
 
-    upload(b_out, out_parq, "music/tracks_refined.parquet",
-           content_type="application/octet-stream")
-    upload(b_out, out_csv, "music/tracks_refined.csv",
-           content_type="text/csv")
+    upload(b_out, out_parquet, "music/tracks_refined.parquet", content_type="application/octet-stream")
+    upload(b_out, out_csv, "music/tracks_refined.csv", content_type="text/csv")
 
-    # 4) Covers conversion (if any were downloaded in landing)
-    res = s3().list_objects_v2(
-        Bucket=b_in,
-        Prefix="music/persistent_landing/covers/"
-    )
+    # 3) Covers: ONLY those from this run (manifest-driven)
+    manifest = load_manifest()
+    wanted_covers = covers_to_convert_from_manifest(manifest)
+
     converted = 0
-    for obj in (res.get("Contents") or []):
-        key = obj["Key"]
-        if not key.lower().endswith(".jpg"):
-            continue
+    kept = 0
 
-        local = Path("cache/landing/covers") / Path(key).name
-        download(b_in, key, local)
+    landing_covers_dir = Path("cache/landing/album_covers")
+    formatted_covers_dir = Path("cache/formatted/covers")
+    formatted_covers_dir.mkdir(parents=True, exist_ok=True)
 
-        im = Image.open(local).convert("RGB").resize((256, 256))
-        outp = Path("cache/formatted/covers") / Path(local).with_suffix(".png").name
-        outp.parent.mkdir(parents=True, exist_ok=True)
-        im.save(outp)
+    for fname in wanted_covers:
+        # Prefer local cover first
+        local_jpg = landing_covers_dir / fname
+        if not local_jpg.exists():
+            # fallback: try to download from S3 (non-fatal)
+            download(b_in, f"music/persistent_landing/covers/{fname}", local_jpg)
 
-        upload(b_out, outp, f"music/covers/{outp.name}",
-               content_type="image/png")
-        converted += 1
+        if not local_jpg.exists():
+            continue  # couldn't get it
 
-    # 5) Summary
+        try:
+            im = Image.open(local_jpg).convert("RGB").resize((256, 256))
+            out_png = formatted_covers_dir / (Path(fname).with_suffix(".png").name)
+            im.save(out_png)
+            converted += 1
+            kept += 1
+
+            upload(b_out, out_png, f"music/covers/{out_png.name}", content_type="image/png")
+
+        except Exception as e:
+            print(f"[WARN] cover convert failed for {local_jpg}: {e}")
+
     summary = {
         "formatted_rows": int(len(df_refined)),
-        "covers_converted": converted,
+        "covers_requested_from_manifest": int(len(wanted_covers)),
+        "covers_converted": int(converted),
         "output_files": [
             "music/tracks_refined.parquet",
             "music/tracks_refined.csv",
-        ]
+        ],
     }
 
-    summ_path = out_dir / "format_summary.json"
-    summ_path.write_text(json.dumps(summary, indent=2))
-
-    upload(b_out, summ_path, "music/summary/format_summary.json",
-           content_type="application/json")
+    (out_dir / "format_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    upload(b_out, out_dir / "format_summary.json", "music/summary/format_summary.json", content_type="application/json")
 
     print("=== Formatted summary ===")
     print(json.dumps(summary, indent=2))
+
 
 if __name__ == "__main__":
     main()
