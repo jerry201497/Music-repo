@@ -1,3 +1,4 @@
+# eval_exp_d.py
 import os, json, random
 from pathlib import Path
 
@@ -14,6 +15,19 @@ def parse_ks(s: str):
         if x:
             out.append(int(x))
     return sorted(set(out))
+
+
+def _count_heuristic_versions(metadatas):
+    """
+    Count heuristic versions present in the collection metadata.
+    Returns: dict[str, int]
+    """
+    counts = {}
+    for m in (metadatas or []):
+        m = m or {}
+        hv = m.get("heuristic_version", "unknown")
+        counts[hv] = counts.get(hv, 0) + 1
+    return counts
 
 
 def main():
@@ -40,6 +54,9 @@ def main():
     if not ids:
         raise RuntimeError(f"[ERROR] Collection '{collection_name}' is empty at {chroma_path}")
 
+    # --- PATCH: heuristic version traceability summary ---
+    hv_counts = _count_heuristic_versions(metas)
+
     # --- Build lists + a pair_id -> audio_id mapping from what's ACTUALLY in Chroma ---
     text_items = []
     pair_to_audio_id = {}
@@ -59,7 +76,11 @@ def main():
             if pair_id:
                 pair_to_audio_id[pair_id] = _id
 
-    print(f"[DEBUG] items in collection: total={len(ids)} text={n_text} audio={n_audio} pairs_with_audio={len(pair_to_audio_id)}")
+    print(
+        f"[DEBUG] items in collection: total={len(ids)} text={n_text} audio={n_audio} "
+        f"pairs_with_audio={len(pair_to_audio_id)}"
+    )
+    print("[DEBUG] heuristic_version counts:", json.dumps(hv_counts, indent=2))
 
     if n_audio == 0:
         raise RuntimeError("[ERROR] No audio items found (modality='audio'). Exploitation indexing didn't store audio modality.")
@@ -77,7 +98,7 @@ def main():
     skipped_no_pair = 0
     skipped_missing_audio = 0
 
-    n_results = min(500, n_audio) # limit to reasonable number
+    n_results = min(500, n_audio)  # limit to reasonable number
 
     for _text_id, pair_id, doc in text_items:
         if not pair_id:
@@ -89,12 +110,12 @@ def main():
             skipped_missing_audio += 1
             continue
 
-        # ✅ KEY FIX: query ONLY audio candidates
+        # ✅ query ONLY audio candidates
         res = col.query(
             query_texts=[doc],
             n_results=n_results,
             where={"modality": "audio"},
-            include=["metadatas", "documents", "distances"],  # no "ids" here
+            include=["metadatas", "documents", "distances"],  # ids returned by default
         )
 
         cand_ids = (res.get("ids") or [[]])[0]
@@ -142,6 +163,8 @@ def main():
         "mean_rank": mean_rank,
         "rank_min": int(np.min(ranks_arr)),
         "rank_max": int(np.max(ranks_arr)),
+        # --- PATCH: include heuristic version distribution ---
+        "heuristic_versions_in_collection": hv_counts,
     }
 
     Path("reports").mkdir(exist_ok=True)
