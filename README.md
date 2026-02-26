@@ -1,13 +1,9 @@
 Multimodal Musical Catalog and Advisor
 
-Algorithms, Data Structures and Databases
-
 Authors:
 Edwin Santiago Delgado Rospigliosi
 
-Date: October 2025
-
-github: https://github.com/jerry201497/ADSDB_2025
+github: https://github.com/jerry201497/Music-repo
 
 1. Project Overview
 
@@ -151,7 +147,7 @@ Visualization	Matplotlib
 Orchestration	Custom pipeline scripts
 Configuration	.env environment variables
 7. Project Structure
-ADSDB_2025/
+Music/
 │
 ├── src/
 │   └── music/
@@ -221,12 +217,3 @@ Larger-scale datasets
 Interactive user interfaces for exploration and recommendation
 Retrieval-Augmented Generation (RAG) for music discovery
 
-12. Educational Value
-
-This project demonstrates:
-End-to-end DataOps pipelines
-Multimodal data integration
-Vector databases and semantic search
-Performance-aware experimental design
-Critical evaluation of multimodal systems
-It serves as a complete academic example of modern data engineering and multimodal AI workflows.
