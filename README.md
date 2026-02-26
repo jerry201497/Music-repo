@@ -147,7 +147,7 @@ Visualization	Matplotlib
 Orchestration	Custom pipeline scripts
 Configuration	.env environment variables
 7. Project Structure
-Music/
+Music-repo/
 │
 ├── src/
 │   └── music/
